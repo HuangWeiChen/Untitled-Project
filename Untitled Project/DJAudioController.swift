@@ -1,23 +1,6 @@
 import AVFoundation
 import Observation
 
-private enum AudioDecodeError: LocalizedError {
-    case bufferAllocationFailed
-    case converterUnavailable
-    case conversionFailed
-
-    var errorDescription: String? {
-        switch self {
-        case .bufferAllocationFailed:
-            "無法建立音訊暫存區。"
-        case .converterUnavailable:
-            "這個音檔格式無法轉成播放格式。"
-        case .conversionFailed:
-            "音檔解碼後沒有可播放資料。"
-        }
-    }
-}
-
 @MainActor
 @Observable
 final class DJAudioController {
@@ -36,13 +19,21 @@ final class DJAudioController {
     private let masterMixer = AVAudioMixerNode()
     private let masterEQ = AVAudioUnitEQ(numberOfBands: 3)
     private let reverb = AVAudioUnitReverb()
-    private let sampleRate = 44_100.0
+    private let format = AVAudioFormat(standardFormatWithSampleRate: 44100.0, channels: 2)!
+
+    // AVPlayer instances for universal file playback (MP3, M4A, AAC, DASH, WAV, AIFF, etc.)
+    private var leftFilePlayer: AVPlayer?
+    private var rightFilePlayer: AVPlayer?
+    private var leftLoopObserver: NSObjectProtocol?
+    private var rightLoopObserver: NSObjectProtocol?
 
     private var leftTrackID: DJTrack.ID?
     private var rightTrackID: DJTrack.ID?
     private var isGraphConfigured = false
     private var echoEnabled = false
-    private var decodedFileBuffers: [URL: AVAudioPCMBuffer] = [:]
+    private var currentLeftGain: Double = 0.85
+    private var currentRightGain: Double = 0.85
+    private var currentCrossfader: Double = 0.5
 
     var isEngineRunning = false
     var errorMessage: String?
@@ -60,13 +51,14 @@ final class DJAudioController {
         reverbAmount: Double
     ) {
         do {
-            try configureGraphIfNeeded()
             try configureAudioSession()
+            try configureGraphIfNeeded()
             try startEngineIfNeeded()
-            load(leftTrack, on: .left)
-            load(rightTrack, on: .right)
-            setPlaying(leftIsPlaying, on: .left)
-            setPlaying(rightIsPlaying, on: .right)
+            currentLeftGain = leftGain
+            currentRightGain = rightGain
+            currentCrossfader = crossfader
+            load(leftTrack, on: .left, isPlaying: leftIsPlaying)
+            load(rightTrack, on: .right, isPlaying: rightIsPlaying)
             updateMix(leftGain: leftGain, rightGain: rightGain, crossfader: crossfader)
             updateEffects(filter: filter, reverbAmount: reverbAmount)
             errorMessage = nil
@@ -75,19 +67,39 @@ final class DJAudioController {
         }
     }
 
-    func load(_ track: DJTrack, on deck: Deck) {
+    func load(_ track: DJTrack, on deck: Deck, isPlaying: Bool = false) {
         do {
+            try configureAudioSession()
             try configureGraphIfNeeded()
+            try startEngineIfNeeded()
+
             let player = playerNode(for: deck)
+            let wasPlaying = player.isPlaying || isDeckPlaying(deck)
+
             player.stop()
+            stopFilePlayer(for: deck)
 
             switch track.source {
             case .synth:
                 let buffer = makeLoopBuffer(for: track)
                 player.scheduleBuffer(buffer, at: nil, options: .loops)
+
             case .file(let url):
-                let buffer = try decodedBuffer(for: url)
-                player.scheduleBuffer(buffer, at: nil)
+                let playerItem = AVPlayerItem(url: url)
+                let filePlayer = AVPlayer(playerItem: playerItem)
+                filePlayer.automaticallyWaitsToMinimizeStalling = false
+
+                let loopObserver = NotificationCenter.default.addObserver(
+                    forName: .AVPlayerItemDidPlayToEndTime,
+                    object: playerItem,
+                    queue: .main
+                ) { [weak filePlayer] _ in
+                    filePlayer?.seek(to: .zero)
+                    filePlayer?.play()
+                }
+
+                setFilePlayer(filePlayer, observer: loopObserver, for: deck)
+                updateFilePlayerVolume(for: deck)
             }
 
             switch deck {
@@ -97,19 +109,26 @@ final class DJAudioController {
                 rightTrackID = track.id
             }
             errorMessage = nil
+
+            if isPlaying || wasPlaying {
+                setPlaying(true, on: deck)
+            }
         } catch {
             errorMessage = "載入音軌失敗：\(error.localizedDescription)"
         }
     }
 
     func reset(_ track: DJTrack, on deck: Deck) {
+        if let filePlayer = filePlayer(for: deck) {
+            filePlayer.seek(to: .zero)
+        }
         load(track, on: deck)
     }
 
     func setPlaying(_ isPlaying: Bool, on deck: Deck) {
         do {
-            try configureGraphIfNeeded()
             try configureAudioSession()
+            try configureGraphIfNeeded()
             try startEngineIfNeeded()
         } catch {
             errorMessage = "播放失敗：\(error.localizedDescription)"
@@ -117,38 +136,81 @@ final class DJAudioController {
         }
 
         let player = playerNode(for: deck)
+        let filePlayer = filePlayer(for: deck)
+
         if isPlaying {
-            if !player.isPlaying {
-                do {
+            if let filePlayer {
+                updateFilePlayerVolume(for: deck)
+                filePlayer.play()
+            } else {
+                if !player.isPlaying {
                     player.play()
-                    errorMessage = nil
-                } catch {
-                    errorMessage = "播放失敗：\(error.localizedDescription)"
                 }
             }
         } else {
+            filePlayer?.pause()
             player.pause()
+        }
+        errorMessage = nil
+    }
+
+    private func isDeckPlaying(_ deck: Deck) -> Bool {
+        switch deck {
+        case .left:
+            if let filePlayer = leftFilePlayer {
+                return filePlayer.timeControlStatus == .playing || filePlayer.rate > 0
+            }
+            return leftPlayer.isPlaying
+        case .right:
+            if let filePlayer = rightFilePlayer {
+                return filePlayer.timeControlStatus == .playing || filePlayer.rate > 0
+            }
+            return rightPlayer.isPlaying
         }
     }
 
     func updateMix(leftGain: Double, rightGain: Double, crossfader: Double) {
-        let leftFade = Float(1.0 - max(0.0, min(1.0, crossfader)))
-        let rightFade = Float(max(0.0, min(1.0, crossfader)))
-        leftMixer.outputVolume = Float(leftGain) * max(0.08, leftFade)
-        rightMixer.outputVolume = Float(rightGain) * max(0.08, rightFade)
+        currentLeftGain = leftGain
+        currentRightGain = rightGain
+        currentCrossfader = crossfader
+
+        let clampedCF = max(0.0, min(1.0, crossfader))
+        // Equal power / smooth crossfader curve: at center (0.5), both tracks remain at 100% volume
+        let leftFade: Float = clampedCF <= 0.5 ? 1.0 : Float(max(0.0, 2.0 * (1.0 - clampedCF)))
+        let rightFade: Float = clampedCF >= 0.5 ? 1.0 : Float(max(0.0, 2.0 * clampedCF))
+
+        let leftVol = Float(leftGain) * leftFade
+        let rightVol = Float(rightGain) * rightFade
+
+        leftMixer.outputVolume = leftVol
+        rightMixer.outputVolume = rightVol
+
+        leftFilePlayer?.volume = leftVol
+        rightFilePlayer?.volume = rightVol
+    }
+
+    private func updateFilePlayerVolume(for deck: Deck) {
+        let clampedCF = max(0.0, min(1.0, currentCrossfader))
+        let leftFade: Float = clampedCF <= 0.5 ? 1.0 : Float(max(0.0, 2.0 * (1.0 - clampedCF)))
+        let rightFade: Float = clampedCF >= 0.5 ? 1.0 : Float(max(0.0, 2.0 * clampedCF))
+
+        switch deck {
+        case .left:
+            leftFilePlayer?.volume = Float(currentLeftGain) * leftFade
+        case .right:
+            rightFilePlayer?.volume = Float(currentRightGain) * rightFade
+        }
     }
 
     func updateEQ(low: Double, mid: Double, high: Double) {
         guard masterEQ.bands.count >= 3 else { return }
 
-        // Low band
         let lowBand = masterEQ.bands[0]
         lowBand.filterType = .lowShelf
         lowBand.frequency = 180.0
         lowBand.gain = Float((low - 0.5) * 24.0)
         lowBand.bypass = false
 
-        // Mid band
         let midBand = masterEQ.bands[1]
         midBand.filterType = .parametric
         midBand.frequency = 1000.0
@@ -156,7 +218,6 @@ final class DJAudioController {
         midBand.gain = Float((mid - 0.5) * 18.0)
         midBand.bypass = false
 
-        // High band
         let highBand = masterEQ.bands[2]
         highBand.filterType = .highShelf
         highBand.frequency = 6000.0
@@ -175,30 +236,29 @@ final class DJAudioController {
     }
 
     func cut(_ deck: Deck, isMuted: Bool) {
-        mixerNode(for: deck).outputVolume = isMuted ? 0 : 0.75
+        let vol: Float = isMuted ? 0 : 0.85
+        mixerNode(for: deck).outputVolume = vol
+        switch deck {
+        case .left: leftFilePlayer?.volume = vol
+        case .right: rightFilePlayer?.volume = vol
+        }
     }
 
-    func triggerDrop() {
-        triggerSFX(.drop)
-    }
+    func triggerDrop() { triggerSFX(.drop) }
 
     func triggerSFX(_ sfx: SFXType) {
         do {
-            try configureGraphIfNeeded()
             try configureAudioSession()
+            try configureGraphIfNeeded()
             try startEngineIfNeeded()
 
             sfxPlayer.stop()
             let buffer: AVAudioPCMBuffer
             switch sfx {
-            case .drop:
-                buffer = makeDropBuffer()
-            case .scratch:
-                buffer = makeScratchBuffer()
-            case .airhorn:
-                buffer = makeAirhornBuffer()
-            case .laser:
-                buffer = makeLaserBuffer()
+            case .drop: buffer = makeDropBuffer()
+            case .scratch: buffer = makeScratchBuffer()
+            case .airhorn: buffer = makeAirhornBuffer()
+            case .laser: buffer = makeLaserBuffer()
             }
 
             sfxPlayer.scheduleBuffer(buffer, at: nil)
@@ -223,32 +283,33 @@ final class DJAudioController {
         engine.attach(masterEQ)
         engine.attach(reverb)
 
-        let format = engineFormat
-        try connect(leftPlayer, to: leftMixer, format: format)
-        try connect(rightPlayer, to: rightMixer, format: format)
-        try connect(sfxPlayer, to: sfxMixer, format: format)
-        try connect(leftMixer, to: masterMixer, format: format)
-        try connect(rightMixer, to: masterMixer, format: format)
-        try connect(sfxMixer, to: masterMixer, format: format)
-        try connect(masterMixer, to: masterEQ, format: format)
-        try connect(masterEQ, to: reverb, format: format)
-        try connect(reverb, to: engine.mainMixerNode, format: format)
+        engine.connect(leftPlayer, to: leftMixer, format: format)
+        engine.connect(rightPlayer, to: rightMixer, format: format)
+        engine.connect(sfxPlayer, to: sfxMixer, format: format)
 
-        sfxMixer.outputVolume = 0.85
+        engine.connect(leftMixer, to: masterMixer, format: format)
+        engine.connect(rightMixer, to: masterMixer, format: format)
+        engine.connect(sfxMixer, to: masterMixer, format: format)
+
+        engine.connect(masterMixer, to: masterEQ, format: format)
+        engine.connect(masterEQ, to: reverb, format: format)
+        engine.connect(reverb, to: engine.mainMixerNode, format: format)
+
+        leftMixer.outputVolume = 0.85
+        rightMixer.outputVolume = 0.85
+        sfxMixer.outputVolume = 0.95
+        masterMixer.outputVolume = 1.0
         reverb.loadFactoryPreset(.mediumRoom)
         reverb.wetDryMix = 18
+
         engine.prepare()
         isGraphConfigured = true
-    }
-
-    private func connect(_ sourceNode: AVAudioNode, to destinationNode: AVAudioNode, format: AVAudioFormat?) throws {
-        try engine.connectNode(sourceNode, to: destinationNode, format: format)
     }
 
     private func configureAudioSession() throws {
         #if os(iOS)
         let session = AVAudioSession.sharedInstance()
-        try session.setCategory(.playback, mode: .default, options: [.mixWithOthers])
+        try session.setCategory(.playback, mode: .default, options: [])
         try session.setActive(true)
         #endif
     }
@@ -264,87 +325,69 @@ final class DJAudioController {
 
     private func playerNode(for deck: Deck) -> AVAudioPlayerNode {
         switch deck {
-        case .left: leftPlayer
-        case .right: rightPlayer
+        case .left: return leftPlayer
+        case .right: return rightPlayer
         }
     }
 
     private func mixerNode(for deck: Deck) -> AVAudioMixerNode {
         switch deck {
-        case .left: leftMixer
-        case .right: rightMixer
+        case .left: return leftMixer
+        case .right: return rightMixer
         }
     }
 
-    private func decodedBuffer(for url: URL) throws -> AVAudioPCMBuffer {
-        if let cachedBuffer = decodedFileBuffers[url] {
-            return cachedBuffer
+    private func filePlayer(for deck: Deck) -> AVPlayer? {
+        switch deck {
+        case .left: return leftFilePlayer
+        case .right: return rightFilePlayer
         }
-
-        let file = try AVAudioFile(forReading: url)
-        let inputFormat = file.processingFormat
-        guard let inputBuffer = AVAudioPCMBuffer(
-            pcmFormat: inputFormat,
-            frameCapacity: AVAudioFrameCount(file.length)
-        ) else {
-            throw AudioDecodeError.bufferAllocationFailed
-        }
-        try file.read(into: inputBuffer)
-
-        let outputFormat = engineFormat
-        guard let converter = AVAudioConverter(from: inputFormat, to: outputFormat) else {
-            throw AudioDecodeError.converterUnavailable
-        }
-
-        let sampleRateRatio = outputFormat.sampleRate / inputFormat.sampleRate
-        let outputFrameCapacity = AVAudioFrameCount(Double(inputBuffer.frameLength) * sampleRateRatio) + 1
-        guard let outputBuffer = AVAudioPCMBuffer(
-            pcmFormat: outputFormat,
-            frameCapacity: outputFrameCapacity
-        ) else {
-            throw AudioDecodeError.bufferAllocationFailed
-        }
-
-        var didProvideInput = false
-        var conversionError: NSError?
-        let status = converter.convert(to: outputBuffer, error: &conversionError) { _, outStatus in
-            if didProvideInput {
-                outStatus.pointee = .endOfStream
-                return nil
-            }
-
-            didProvideInput = true
-            outStatus.pointee = .haveData
-            return inputBuffer
-        }
-
-        if let conversionError {
-            throw conversionError
-        }
-
-        guard status != .error, outputBuffer.frameLength > 0 else {
-            throw AudioDecodeError.conversionFailed
-        }
-
-        decodedFileBuffers[url] = outputBuffer
-        return outputBuffer
     }
 
-    private var engineFormat: AVAudioFormat {
-        AVAudioFormat(standardFormatWithSampleRate: sampleRate, channels: 2)!
+    private func setFilePlayer(_ player: AVPlayer?, observer: NSObjectProtocol?, for deck: Deck) {
+        switch deck {
+        case .left:
+            if let obs = leftLoopObserver { NotificationCenter.default.removeObserver(obs) }
+            leftFilePlayer?.pause()
+            leftFilePlayer = player
+            leftLoopObserver = observer
+        case .right:
+            if let obs = rightLoopObserver { NotificationCenter.default.removeObserver(obs) }
+            rightFilePlayer?.pause()
+            rightFilePlayer = player
+            rightLoopObserver = observer
+        }
     }
+
+    private func stopFilePlayer(for deck: Deck) {
+        switch deck {
+        case .left:
+            if let obs = leftLoopObserver { NotificationCenter.default.removeObserver(obs) }
+            leftLoopObserver = nil
+            leftFilePlayer?.pause()
+            leftFilePlayer = nil
+        case .right:
+            if let obs = rightLoopObserver { NotificationCenter.default.removeObserver(obs) }
+            rightLoopObserver = nil
+            rightFilePlayer?.pause()
+            rightFilePlayer = nil
+        }
+    }
+
+    // MARK: - Synth Buffers
 
     private func makeLoopBuffer(for track: DJTrack) -> AVAudioPCMBuffer {
         let beatsPerLoop = 8.0
         let secondsPerBeat = 60.0 / Double(track.bpm)
         let loopDuration = beatsPerLoop * secondsPerBeat
-        let frameCapacity = AVAudioFrameCount(loopDuration * sampleRate)
-        let buffer = AVAudioPCMBuffer(pcmFormat: engineFormat, frameCapacity: frameCapacity)!
+        let frameCapacity = AVAudioFrameCount(loopDuration * format.sampleRate)
+        let buffer = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: frameCapacity)!
         buffer.frameLength = frameCapacity
 
         guard let channels = buffer.floatChannelData else { return buffer }
         let frameCount = Int(frameCapacity)
         let seed = Double(track.synthSeed)
+        let sampleRate = format.sampleRate
 
         for frame in 0..<frameCount {
             let time = Double(frame) / sampleRate
@@ -366,18 +409,18 @@ final class DJAudioController {
             channels[0][frame] = sample
             channels[1][frame] = sample * 0.92
         }
-
         return buffer
     }
 
     private func makeDropBuffer() -> AVAudioPCMBuffer {
         let duration = 1.2
-        let frameCapacity = AVAudioFrameCount(duration * sampleRate)
-        let buffer = AVAudioPCMBuffer(pcmFormat: engineFormat, frameCapacity: frameCapacity)!
+        let frameCapacity = AVAudioFrameCount(duration * format.sampleRate)
+        let buffer = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: frameCapacity)!
         buffer.frameLength = frameCapacity
 
         guard let channels = buffer.floatChannelData else { return buffer }
         let frameCount = Int(frameCapacity)
+        let sampleRate = format.sampleRate
 
         for frame in 0..<frameCount {
             let progress = Double(frame) / Double(frameCount)
@@ -390,18 +433,18 @@ final class DJAudioController {
             channels[0][frame] = sample
             channels[1][frame] = sample * 0.92
         }
-
         return buffer
     }
 
     private func makeScratchBuffer() -> AVAudioPCMBuffer {
         let duration = 0.65
-        let frameCapacity = AVAudioFrameCount(duration * sampleRate)
-        let buffer = AVAudioPCMBuffer(pcmFormat: engineFormat, frameCapacity: frameCapacity)!
+        let frameCapacity = AVAudioFrameCount(duration * format.sampleRate)
+        let buffer = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: frameCapacity)!
         buffer.frameLength = frameCapacity
 
         guard let channels = buffer.floatChannelData else { return buffer }
         let frameCount = Int(frameCapacity)
+        let sampleRate = format.sampleRate
 
         for frame in 0..<frameCount {
             let progress = Double(frame) / Double(frameCount)
@@ -414,25 +457,24 @@ final class DJAudioController {
             channels[0][frame] = sample
             channels[1][frame] = sample
         }
-
         return buffer
     }
 
     private func makeAirhornBuffer() -> AVAudioPCMBuffer {
         let duration = 0.85
-        let frameCapacity = AVAudioFrameCount(duration * sampleRate)
-        let buffer = AVAudioPCMBuffer(pcmFormat: engineFormat, frameCapacity: frameCapacity)!
+        let frameCapacity = AVAudioFrameCount(duration * format.sampleRate)
+        let buffer = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: frameCapacity)!
         buffer.frameLength = frameCapacity
 
         guard let channels = buffer.floatChannelData else { return buffer }
         let frameCount = Int(frameCapacity)
+        let sampleRate = format.sampleRate
 
         for frame in 0..<frameCount {
             let progress = Double(frame) / Double(frameCount)
             let time = Double(frame) / sampleRate
             let env = pow(sin(progress * .pi), 0.5)
 
-            // Multi-tone chord for reggae airhorn
             let f1 = sin(2.0 * .pi * 466.16 * time)
             let f2 = sin(2.0 * .pi * 587.33 * time)
             let f3 = sin(2.0 * .pi * 698.46 * time)
@@ -441,18 +483,18 @@ final class DJAudioController {
             channels[0][frame] = sample
             channels[1][frame] = sample
         }
-
         return buffer
     }
 
     private func makeLaserBuffer() -> AVAudioPCMBuffer {
         let duration = 0.7
-        let frameCapacity = AVAudioFrameCount(duration * sampleRate)
-        let buffer = AVAudioPCMBuffer(pcmFormat: engineFormat, frameCapacity: frameCapacity)!
+        let frameCapacity = AVAudioFrameCount(duration * format.sampleRate)
+        let buffer = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: frameCapacity)!
         buffer.frameLength = frameCapacity
 
         guard let channels = buffer.floatChannelData else { return buffer }
         let frameCount = Int(frameCapacity)
+        let sampleRate = format.sampleRate
 
         for frame in 0..<frameCount {
             let progress = Double(frame) / Double(frameCount)
@@ -465,7 +507,6 @@ final class DJAudioController {
             channels[0][frame] = sample
             channels[1][frame] = sample
         }
-
         return buffer
     }
 

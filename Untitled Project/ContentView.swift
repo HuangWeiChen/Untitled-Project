@@ -66,7 +66,8 @@ struct ContentView: View {
                                 onImportRequested: { isImportingAudio = true },
                                 onLoadLeft: loadSelectedTrackToLeftDeck,
                                 onLoadRight: loadSelectedTrackToRightDeck,
-                                onTriggerPad: triggerPad
+                                onTriggerPad: triggerPad,
+                                onDeleteTrack: deleteImportedTrack
                             )
 
                         case 1:
@@ -96,6 +97,8 @@ struct ContentView: View {
         }
         .tint(.cyan)
         .task {
+            loadExistingImportedTracks()
+
             audioController.prepare(
                 leftTrack: leftDeck.track,
                 rightTrack: rightDeck.track,
@@ -111,7 +114,7 @@ struct ContentView: View {
         }
         .fileImporter(
             isPresented: $isImportingAudio,
-            allowedContentTypes: [.mp3, .mpeg4Audio, .wav, .aiff],
+            allowedContentTypes: [.audio, .mp3, .mpeg4Audio, .wav, .aiff],
             allowsMultipleSelection: true,
             onCompletion: handleAudioImport
         )
@@ -147,20 +150,102 @@ struct ContentView: View {
         }
     }
 
+    private func deleteImportedTrack(_ track: DJTrack) {
+        withAnimation(.easeInOut(duration: 0.25)) {
+            // If loaded on deck A, revert deck A to sample 0
+            if leftDeck.track.id == track.id {
+                leftDeck.track = DJTrack.samples[0]
+                leftDeck.bpm = DJTrack.samples[0].bpm
+                audioController.load(DJTrack.samples[0], on: .left, isPlaying: leftDeck.isPlaying)
+            }
+            // If loaded on deck B, revert deck B to sample 1
+            if rightDeck.track.id == track.id {
+                rightDeck.track = DJTrack.samples[1]
+                rightDeck.bpm = DJTrack.samples[1].bpm
+                audioController.load(DJTrack.samples[1], on: .right, isPlaying: rightDeck.isPlaying)
+            }
+
+            // Remove physical file from disk
+            if case .file(let url) = track.source {
+                try? FileManager.default.removeItem(at: url)
+            }
+
+            // Remove from imported list
+            importedTracks.removeAll(where: { $0.id == track.id })
+
+            if selectedTrack == track.id {
+                selectedTrack = tracks.first?.id ?? DJTrack.samples[0].id
+            }
+
+            importMessage = "已成功刪除「\(track.title)」！"
+        }
+    }
+
+    private func loadExistingImportedTracks() {
+        let fileManager = FileManager.default
+        guard let documentsURL = try? fileManager.url(
+            for: .documentDirectory,
+            in: .userDomainMask,
+            appropriateFor: nil,
+            create: false
+        ) else { return }
+
+        let importsURL = documentsURL.appendingPathComponent("Imported Audio", isDirectory: true)
+        guard let files = try? fileManager.contentsOfDirectory(at: importsURL, includingPropertiesForKeys: [.fileSizeKey]) else { return }
+
+        var loaded: [DJTrack] = []
+        for file in files {
+            let attributes = (try? fileManager.attributesOfItem(atPath: file.path)) ?? [:]
+            let size = (attributes[.size] as? NSNumber)?.int64Value ?? 0
+            if size == 0 {
+                try? fileManager.removeItem(at: file)
+                continue
+            }
+
+            var cleanName = file.deletingPathExtension().lastPathComponent
+            // Remove UUID prefix if present
+            if cleanName.count > 37 && cleanName.dropFirst(36).starts(with: "-") {
+                cleanName = String(cleanName.dropFirst(37))
+            }
+
+            let metadata = audioMetadata(for: file)
+            let track = DJTrack(
+                title: cleanName.isEmpty ? "Imported Track" : cleanName,
+                artist: "已匯入樂曲",
+                duration: metadata.duration,
+                bpm: metadata.bpm,
+                color: DJTrack.importColors[loaded.count % DJTrack.importColors.count],
+                source: .file(file)
+            )
+            loaded.append(track)
+        }
+
+        if !loaded.isEmpty {
+            importedTracks = loaded
+            if let first = loaded.first {
+                selectedTrack = first.id
+                leftDeck.track = first
+                leftDeck.bpm = first.bpm
+            }
+        }
+    }
+
     private func loadSelectedTrackToLeftDeck() {
         guard let track = tracks.first(where: { $0.id == selectedTrack }) else { return }
         leftDeck.track = track
         leftDeck.bpm = track.bpm
-        audioController.load(track, on: .left)
-        audioController.setPlaying(leftDeck.isPlaying, on: .left)
+        leftDeck.isPlaying = true
+        audioController.load(track, on: .left, isPlaying: true)
+        updateAudioMix()
     }
 
     private func loadSelectedTrackToRightDeck() {
         guard let track = tracks.first(where: { $0.id == selectedTrack }) else { return }
         rightDeck.track = track
         rightDeck.bpm = track.bpm
-        audioController.load(track, on: .right)
-        audioController.setPlaying(rightDeck.isPlaying, on: .right)
+        rightDeck.isPlaying = true
+        audioController.load(track, on: .right, isPlaying: true)
+        updateAudioMix()
     }
 
     private func updateAudioMix() {
@@ -179,6 +264,8 @@ struct ContentView: View {
             leftDeck.isPlaying = true
             rightDeck.isPlaying = true
             crossfader = 0.5
+            audioController.setPlaying(true, on: .left)
+            audioController.setPlaying(true, on: .right)
             updateAudioMix()
         case 1: // LOOP 4B
             audioController.reset(leftDeck.track, on: .left)
@@ -193,6 +280,8 @@ struct ContentView: View {
             leftDeck.isPlaying = true
             rightDeck.isPlaying = true
             crossfader = 0.5
+            audioController.setPlaying(true, on: .left)
+            audioController.setPlaying(true, on: .right)
             audioController.triggerSFX(.drop)
         case 4: // ECHO DRY
             audioController.setEchoEnabled(true, reverbAmount: 0.82)
@@ -214,30 +303,48 @@ struct ContentView: View {
     private func handleAudioImport(_ result: Result<[URL], Error>) {
         do {
             let urls = try result.get()
-            let newTracks = try urls.map(makeImportedTrack)
-            importedTracks.append(contentsOf: newTracks)
-            if let first = newTracks.first {
-                selectedTrack = first.id
+            guard !urls.isEmpty else { return }
+
+            var loadedTracks: [DJTrack] = []
+            for url in urls {
+                let track = try makeImportedTrack(from: url)
+                loadedTracks.append(track)
             }
-            importMessage = "已匯入 \(newTracks.count) 首音訊。"
+
+            importedTracks.append(contentsOf: loadedTracks)
+            if let first = loadedTracks.first {
+                selectedTrack = first.id
+                // 自動載入匯入歌曲至 Deck A 並啟動播放
+                leftDeck.track = first
+                leftDeck.bpm = first.bpm
+                leftDeck.isPlaying = true
+                if crossfader > 0.8 {
+                    crossfader = 0.5
+                }
+                updateAudioMix()
+                audioController.load(first, on: .left, isPlaying: true)
+            }
+            importMessage = "已成功載入「\(loadedTracks.first?.title ?? "")」，音訊解碼就緒！"
         } catch {
             importMessage = "匯入失敗：\(error.localizedDescription)"
         }
     }
 
     private func makeImportedTrack(from sourceURL: URL) throws -> DJTrack {
-        let shouldStopAccessing = sourceURL.startAccessingSecurityScopedResource()
+        let isAccessing = sourceURL.startAccessingSecurityScopedResource()
         defer {
-            if shouldStopAccessing {
+            if isAccessing {
                 sourceURL.stopAccessingSecurityScopedResource()
             }
         }
 
+        let originalTitle = sourceURL.deletingPathExtension().lastPathComponent
         let copiedURL = try copyAudioIntoAppStorage(sourceURL)
         let metadata = audioMetadata(for: copiedURL)
+
         return DJTrack(
-            title: copiedURL.deletingPathExtension().lastPathComponent,
-            artist: "Imported MP3",
+            title: originalTitle.isEmpty ? "Imported Track" : originalTitle,
+            artist: "匯入音訊",
             duration: metadata.duration,
             bpm: metadata.bpm,
             color: DJTrack.importColors[(importedTracks.count + Int.random(in: 0...3)) % DJTrack.importColors.count],
@@ -256,25 +363,69 @@ struct ContentView: View {
         let importsURL = documentsURL.appendingPathComponent("Imported Audio", isDirectory: true)
         try fileManager.createDirectory(at: importsURL, withIntermediateDirectories: true)
 
-        let cleanName = sourceURL.lastPathComponent.isEmpty ? "Imported.mp3" : sourceURL.lastPathComponent
-        let destinationURL = importsURL.appendingPathComponent("\(UUID().uuidString)-\(cleanName)")
+        let ext = sourceURL.pathExtension.isEmpty ? "m4a" : sourceURL.pathExtension
+        let baseName = sourceURL.deletingPathExtension().lastPathComponent.isEmpty ? "Track" : sourceURL.deletingPathExtension().lastPathComponent
+        let destinationURL = importsURL.appendingPathComponent("\(UUID().uuidString)-\(baseName).\(ext)")
+
         if fileManager.fileExists(atPath: destinationURL.path) {
-            try fileManager.removeItem(at: destinationURL)
+            try? fileManager.removeItem(at: destinationURL)
         }
-        try fileManager.copyItem(at: sourceURL, to: destinationURL)
+
+        var coordinationError: NSError?
+        var readData: Data?
+
+        let coordinator = NSFileCoordinator()
+        coordinator.coordinate(readingItemAt: sourceURL, options: [], error: &coordinationError) { coordinatedURL in
+            readData = try? Data(contentsOf: coordinatedURL)
+        }
+
+        if let coordinationError = coordinationError {
+            throw coordinationError
+        }
+
+        if let data = readData, !data.isEmpty {
+            try data.write(to: destinationURL, options: .atomic)
+        } else {
+            // Direct file read fallback
+            if let directData = try? Data(contentsOf: sourceURL), !directData.isEmpty {
+                try directData.write(to: destinationURL, options: .atomic)
+            } else {
+                try fileManager.copyItem(at: sourceURL, to: destinationURL)
+            }
+        }
+
+        let attributes = try fileManager.attributesOfItem(atPath: destinationURL.path)
+        let fileSize = (attributes[.size] as? NSNumber)?.int64Value ?? 0
+        guard fileSize > 0 else {
+            throw NSError(
+                domain: "DJAudioImport",
+                code: -1,
+                userInfo: [NSLocalizedDescriptionKey: "音訊檔案為空 (0 bytes)，無法播放。請確認檔案來源正常。"]
+            )
+        }
+
         return destinationURL
     }
 
     private func audioMetadata(for url: URL) -> (duration: String, bpm: Int) {
-        guard let file = try? AVAudioFile(forReading: url) else {
-            return ("--:--", 128)
+        let asset = AVURLAsset(url: url)
+        let durationSeconds = CMTimeGetSeconds(asset.duration)
+        if durationSeconds.isFinite && durationSeconds > 0 {
+            let minutes = Int(durationSeconds) / 60
+            let remainder = Int(durationSeconds) % 60
+            let duration = String(format: "%02d:%02d", minutes, remainder)
+            return (duration, 128)
         }
 
-        let seconds = Double(file.length) / file.processingFormat.sampleRate
-        let minutes = Int(seconds) / 60
-        let remainder = Int(seconds) % 60
-        let duration = String(format: "%02d:%02d", minutes, remainder)
-        return (duration, 128)
+        if let file = try? AVAudioFile(forReading: url), file.length > 0 {
+            let seconds = Double(file.length) / file.processingFormat.sampleRate
+            let minutes = Int(seconds) / 60
+            let remainder = Int(seconds) % 60
+            let duration = String(format: "%02d:%02d", minutes, remainder)
+            return (duration, 128)
+        }
+
+        return ("--:--", 128)
     }
 }
 
