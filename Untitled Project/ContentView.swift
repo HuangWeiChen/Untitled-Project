@@ -5,18 +5,20 @@ import UniformTypeIdentifiers
 struct ContentView: View {
     @State private var audioController = DJAudioController()
     @State private var importedTracks: [DJTrack] = []
-    @State private var leftDeck = DJDeckState(track: DJTrack.samples[0], bpm: 124, pitch: 0.18, gain: 0.72, isPlaying: false)
-    @State private var rightDeck = DJDeckState(track: DJTrack.samples[1], bpm: 128, pitch: 0.42, gain: 0.64, isPlaying: false)
+    @State private var leftDeck = DJDeckState(track: DJTrack.samples[0], bpm: 124, pitch: 0.0, gain: 0.75, isPlaying: false)
+    @State private var rightDeck = DJDeckState(track: DJTrack.samples[1], bpm: 128, pitch: 0.0, gain: 0.75, isPlaying: false)
     @State private var crossfader = 0.5
     @State private var filter = 0.58
     @State private var reverb = 0.34
+    @State private var lowEQ = 0.5
+    @State private var midEQ = 0.5
+    @State private var highEQ = 0.5
     @State private var selectedPad = 2
     @State private var selectedTrack = DJTrack.samples[0].id
     @State private var boothLightsOn = true
     @State private var isImportingAudio = false
     @State private var importMessage: String?
-    @State private var echoEngaged = false
-    @State private var cutMuted = false
+    @State private var selectedTab = 0
 
     private var tracks: [DJTrack] {
         DJTrack.samples + importedTracks
@@ -26,41 +28,70 @@ struct ContentView: View {
         ZStack {
             DJAtmosphereBackground(isLit: boothLightsOn)
 
-            ScrollView(showsIndicators: false) {
-                VStack(spacing: 18) {
-                    DJHeader(
-                        isLit: $boothLightsOn,
-                        isAudioReady: audioController.isEngineRunning,
-                        errorMessage: audioController.errorMessage,
-                        importMessage: importMessage
-                    )
-
-                    DeckStage(
-                        leftDeck: $leftDeck,
-                        rightDeck: $rightDeck,
-                        crossfader: $crossfader
-                    )
-
-                    MixerConsole(
-                        filter: $filter,
-                        reverb: $reverb,
-                        leftGain: $leftDeck.gain,
-                        rightGain: $rightDeck.gain,
-                        selectedPad: $selectedPad,
-                        onPadTrigger: triggerPad
-                    )
-
-                    TrackLibrary(
-                        tracks: tracks,
-                        selectedTrack: $selectedTrack,
-                        onImport: { isImportingAudio = true },
-                        onLoadLeft: loadSelectedTrackToLeftDeck,
-                        onLoadRight: loadSelectedTrackToRightDeck
-                    )
-                }
+            VStack(spacing: 0) {
+                // Top Global DJ Header
+                DJHeader(
+                    isLit: $boothLightsOn,
+                    isAudioReady: audioController.isEngineRunning,
+                    errorMessage: audioController.errorMessage,
+                    importMessage: importMessage
+                )
                 .padding(.horizontal, 16)
-                .padding(.top, 16)
-                .padding(.bottom, 34)
+                .padding(.top, 12)
+                .padding(.bottom, 8)
+
+                // Page Navigation Tab Segment Selector
+                NavigationSegmentBar(selectedTab: $selectedTab)
+                    .padding(.horizontal, 16)
+                    .padding(.bottom, 12)
+
+                // Main Page Content Area
+                ScrollView(showsIndicators: false) {
+                    VStack(spacing: 16) {
+                        switch selectedTab {
+                        case 0:
+                            LiveMixerStageView(
+                                leftDeck: $leftDeck,
+                                rightDeck: $rightDeck,
+                                crossfader: $crossfader,
+                                filter: $filter,
+                                reverb: $reverb,
+                                lowEQ: $lowEQ,
+                                midEQ: $midEQ,
+                                highEQ: $highEQ,
+                                selectedPad: $selectedPad,
+                                selectedTrack: $selectedTrack,
+                                tracks: tracks,
+                                audioController: audioController,
+                                onImportRequested: { isImportingAudio = true },
+                                onLoadLeft: loadSelectedTrackToLeftDeck,
+                                onLoadRight: loadSelectedTrackToRightDeck,
+                                onTriggerPad: triggerPad
+                            )
+
+                        case 1:
+                            BeginnerComboView(
+                                crossfader: $crossfader,
+                                filter: $filter,
+                                reverb: $reverb,
+                                lowEQ: $lowEQ,
+                                midEQ: $midEQ,
+                                highEQ: $highEQ,
+                                leftDeck: $leftDeck,
+                                rightDeck: $rightDeck,
+                                audioController: audioController
+                            )
+
+                        case 2:
+                            MixingGuideView(audioController: audioController)
+
+                        default:
+                            EmptyView()
+                        }
+                    }
+                    .padding(.horizontal, 16)
+                    .padding(.bottom, 36)
+                }
             }
         }
         .tint(.cyan)
@@ -76,6 +107,7 @@ struct ContentView: View {
                 filter: filter,
                 reverbAmount: reverb
             )
+            audioController.updateEQ(low: lowEQ, mid: midEQ, high: highEQ)
         }
         .fileImporter(
             isPresented: $isImportingAudio,
@@ -96,7 +128,6 @@ struct ContentView: View {
             updateAudioMix()
         }
         .onChange(of: crossfader) { _, _ in
-            cutMuted = false
             updateAudioMix()
         }
         .onChange(of: filter) { _, value in
@@ -104,6 +135,15 @@ struct ContentView: View {
         }
         .onChange(of: reverb) { _, value in
             audioController.updateEffects(filter: filter, reverbAmount: value)
+        }
+        .onChange(of: lowEQ) { _, _ in
+            audioController.updateEQ(low: lowEQ, mid: midEQ, high: highEQ)
+        }
+        .onChange(of: midEQ) { _, _ in
+            audioController.updateEQ(low: lowEQ, mid: midEQ, high: highEQ)
+        }
+        .onChange(of: highEQ) { _, _ in
+            audioController.updateEQ(low: lowEQ, mid: midEQ, high: highEQ)
         }
     }
 
@@ -131,53 +171,44 @@ struct ContentView: View {
         )
     }
 
-    private func triggerPad(_ pad: PadAction) {
-        selectedPad = pad.rawValue
+    private func triggerPad(_ padIndex: Int) {
+        selectedPad = padIndex
 
-        switch pad {
-        case .hot:
+        switch padIndex {
+        case 0: // HOT CUE
             leftDeck.isPlaying = true
             rightDeck.isPlaying = true
             crossfader = 0.5
             updateAudioMix()
-        case .loop:
+        case 1: // LOOP 4B
             audioController.reset(leftDeck.track, on: .left)
             audioController.reset(rightDeck.track, on: .right)
             audioController.setPlaying(leftDeck.isPlaying, on: .left)
             audioController.setPlaying(rightDeck.isPlaying, on: .right)
-        case .fx:
+        case 2: // FX BOOST
             filter = 0.86
             reverb = min(1.0, reverb + 0.22)
             audioController.updateEffects(filter: filter, reverbAmount: reverb)
-        case .drop:
+        case 3: // BASS DROP
             leftDeck.isPlaying = true
             rightDeck.isPlaying = true
             crossfader = 0.5
-            audioController.triggerDrop()
-        case .echo:
-            echoEngaged.toggle()
-            reverb = echoEngaged ? 0.82 : 0.34
-            audioController.setEchoEnabled(echoEngaged, reverbAmount: reverb)
-            audioController.updateEffects(filter: filter, reverbAmount: reverb)
-        case .cut:
-            cutMuted.toggle()
-            audioController.cut(activeDeck, isMuted: cutMuted)
-            if !cutMuted {
-                updateAudioMix()
-            }
-        case .sync:
+            audioController.triggerSFX(.drop)
+        case 4: // ECHO DRY
+            audioController.setEchoEnabled(true, reverbAmount: 0.82)
+        case 5: // CUT MUTE
+            audioController.cut(crossfader > 0.5 ? .right : .left, isMuted: true)
+        case 6: // SYNC BPM
             rightDeck.bpm = leftDeck.bpm
-            importMessage = "SYNC：Deck B 已對齊 Deck A 的 BPM 顯示。"
-        case .cue:
+            importMessage = "SYNC：Deck B 已對齊 Deck A 的 BPM 節奏！"
+        case 7: // RESET CUE
             leftDeck.isPlaying = false
             rightDeck.isPlaying = false
             audioController.reset(leftDeck.track, on: .left)
             audioController.reset(rightDeck.track, on: .right)
+        default:
+            break
         }
-    }
-
-    private var activeDeck: DJAudioController.Deck {
-        crossfader > 0.5 ? .right : .left
     }
 
     private func handleAudioImport(_ result: Result<[URL], Error>) {
@@ -247,115 +278,112 @@ struct ContentView: View {
     }
 }
 
-struct DJTrack: Identifiable, Equatable {
-    let id: UUID
-    let title: String
-    let artist: String
-    let duration: String
-    let bpm: Int
-    let color: Color
-    let source: DJTrackSource
+// MARK: - Navigation Segment Bar
+private struct NavigationSegmentBar: View {
+    @Binding var selectedTab: Int
 
-    var synthSeed: Int {
-        switch source {
-        case .synth(let seed): seed
-        case .file: 17
-        }
-    }
-
-    init(
-        id: UUID = UUID(),
-        title: String,
-        artist: String,
-        duration: String,
-        bpm: Int,
-        color: Color,
-        source: DJTrackSource
-    ) {
-        self.id = id
-        self.title = title
-        self.artist = artist
-        self.duration = duration
-        self.bpm = bpm
-        self.color = color
-        self.source = source
-    }
-
-    static let samples: [DJTrack] = [
-        DJTrack(title: "Midnight Pulse", artist: "Neon Harbor", duration: "03:48", bpm: 124, color: .cyan, source: .synth(seed: 3)),
-        DJTrack(title: "Glass Room", artist: "Mika Lane", duration: "04:12", bpm: 128, color: .pink, source: .synth(seed: 8)),
-        DJTrack(title: "Afterglow Run", artist: "Tape Circuit", duration: "05:06", bpm: 122, color: .yellow, source: .synth(seed: 13)),
-        DJTrack(title: "Signal Drift", artist: "East Terminal", duration: "03:35", bpm: 132, color: .green, source: .synth(seed: 21))
+    private let tabs: [(id: Int, title: String, icon: String)] = [
+        (0, "主控混音台", "headphones"),
+        (1, "新手快捷組合", "bolt.horizontal.fill"),
+        (2, "混音學院 & SFX", "book.closed.fill")
     ]
 
-    static let importColors: [Color] = [.mint, .orange, .indigo, .teal, .red]
-}
-
-enum DJTrackSource: Equatable {
-    case synth(seed: Int)
-    case file(URL)
-}
-
-private enum PadAction: Int, CaseIterable, Identifiable {
-    case hot
-    case loop
-    case fx
-    case drop
-    case echo
-    case cut
-    case sync
-    case cue
-
-    var id: Int { rawValue }
-
-    var title: String {
-        switch self {
-        case .hot: "HOT"
-        case .loop: "LOOP"
-        case .fx: "FX"
-        case .drop: "DROP"
-        case .echo: "ECHO"
-        case .cut: "CUT"
-        case .sync: "SYNC"
-        case .cue: "CUE"
+    var body: some View {
+        HStack(spacing: 6) {
+            ForEach(tabs, id: \.id) { tab in
+                Button {
+                    withAnimation(.spring(response: 0.35, dampingFraction: 0.7)) {
+                        selectedTab = tab.id
+                    }
+                } label: {
+                    HStack(spacing: 6) {
+                        Image(systemName: tab.icon)
+                            .font(.caption.weight(.bold))
+                        Text(tab.title)
+                            .font(.caption.weight(.bold))
+                    }
+                    .foregroundStyle(selectedTab == tab.id ? .black : .white.opacity(0.75))
+                    .padding(.vertical, 10)
+                    .frame(maxWidth: .infinity)
+                    .background(selectedTab == tab.id ? Color.cyan : Color.white.opacity(0.08), in: RoundedRectangle(cornerRadius: 8))
+                }
+                .buttonStyle(.plain)
+            }
         }
-    }
-
-    var systemImage: String {
-        switch self {
-        case .hot: "flame.fill"
-        case .loop: "repeat"
-        case .fx: "sparkles"
-        case .drop: "bolt.fill"
-        case .echo: "dot.radiowaves.left.and.right"
-        case .cut: "scissors"
-        case .sync: "arrow.triangle.2.circlepath"
-        case .cue: "record.circle"
-        }
-    }
-
-    var color: Color {
-        switch self {
-        case .hot: .orange
-        case .loop: .cyan
-        case .fx: .pink
-        case .drop: .yellow
-        case .echo: .green
-        case .cut: .red
-        case .sync: .cyan
-        case .cue: .pink
+        .padding(4)
+        .background(.black.opacity(0.5), in: RoundedRectangle(cornerRadius: 10))
+        .overlay {
+            RoundedRectangle(cornerRadius: 10)
+                .stroke(.white.opacity(0.14), lineWidth: 1)
         }
     }
 }
 
-private struct DJDeckState: Equatable {
-    var track: DJTrack
-    var bpm: Int
-    var pitch: Double
-    var gain: Double
-    var isPlaying: Bool
+// MARK: - DJ Header
+private struct DJHeader: View {
+    @Binding var isLit: Bool
+    let isAudioReady: Bool
+    let errorMessage: String?
+    let importMessage: String?
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            HStack(alignment: .center) {
+                VStack(alignment: .leading, spacing: 4) {
+                    HStack(spacing: 6) {
+                        Circle()
+                            .fill(.red)
+                            .frame(width: 7, height: 7)
+                            .shadow(color: .red.opacity(0.85), radius: 6)
+                        Text("STUDIO LIVE")
+                            .font(.caption2.weight(.bold))
+                            .foregroundStyle(.cyan)
+                    }
+
+                    Text("Night Deck Pro")
+                        .font(.system(.title2, design: .rounded, weight: .black))
+                        .foregroundStyle(.white)
+                }
+
+                Spacer()
+
+                Toggle("燈光", isOn: $isLit)
+                    .labelsHidden()
+                    .toggleStyle(.switch)
+                    .tint(.pink)
+            }
+
+            if let importMessage {
+                Text(importMessage)
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(.cyan.opacity(0.9))
+                    .lineLimit(1)
+            }
+
+            if let errorMessage {
+                Text(errorMessage)
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(.red.opacity(0.9))
+                    .lineLimit(1)
+            }
+        }
+        .padding(14)
+        .background(.black.opacity(0.35), in: RoundedRectangle(cornerRadius: 10))
+        .overlay {
+            RoundedRectangle(cornerRadius: 10)
+                .stroke(
+                    LinearGradient(
+                        colors: [.white.opacity(0.2), .cyan.opacity(0.28), .pink.opacity(0.2)],
+                        startPoint: .topLeading,
+                        endPoint: .bottomTrailing
+                    ),
+                    lineWidth: 1
+                )
+        }
+    }
 }
 
+// MARK: - Background Atmosphere
 private struct DJAtmosphereBackground: View {
     let isLit: Bool
 
@@ -438,579 +466,6 @@ private struct EqualizerFloor: View {
         if index.isMultiple(of: 5) { return .pink }
         if index.isMultiple(of: 3) { return .yellow }
         return .cyan
-    }
-}
-
-private struct DJHeader: View {
-    @Binding var isLit: Bool
-    let isAudioReady: Bool
-    let errorMessage: String?
-    let importMessage: String?
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 16) {
-            HStack(alignment: .top) {
-                VStack(alignment: .leading, spacing: 8) {
-                    HStack(spacing: 8) {
-                        Circle()
-                            .fill(.red)
-                            .frame(width: 8, height: 8)
-                            .shadow(color: .red.opacity(0.85), radius: 8)
-                        Text("LIVE MIX")
-                            .font(.caption.weight(.bold))
-                            .foregroundStyle(.cyan)
-                    }
-
-                    Text("Night Deck")
-                        .font(.system(.largeTitle, design: .rounded, weight: .black))
-                        .foregroundStyle(.white)
-
-                    Text("雙軌混音、熱鍵 Pad、MP3 匯入、即時氛圍燈光，讓手機像一座迷你 DJ Booth。")
-                        .font(.subheadline.weight(.medium))
-                        .foregroundStyle(.white.opacity(0.72))
-                        .lineLimit(3)
-                }
-
-                Spacer(minLength: 12)
-
-                Toggle("燈光", isOn: $isLit)
-                    .labelsHidden()
-                    .toggleStyle(.switch)
-                    .tint(.pink)
-            }
-
-            HStack(spacing: 10) {
-                HeaderBadge(title: "128", caption: "BPM", systemImage: "metronome.fill", color: .yellow)
-                HeaderBadge(
-                    title: isAudioReady ? "READY" : "TAP",
-                    caption: "AUDIO",
-                    systemImage: isAudioReady ? "speaker.wave.2.fill" : "speaker.slash.fill",
-                    color: isAudioReady ? .green : .cyan
-                )
-                HeaderBadge(title: "MP3", caption: "IMPORT", systemImage: "square.and.arrow.down.fill", color: .pink)
-            }
-
-            if let importMessage {
-                Text(importMessage)
-                    .font(.caption.weight(.semibold))
-                    .foregroundStyle(.cyan.opacity(0.9))
-                    .lineLimit(2)
-            }
-
-            if let errorMessage {
-                Text(errorMessage)
-                    .font(.caption.weight(.semibold))
-                    .foregroundStyle(.red.opacity(0.9))
-                    .lineLimit(2)
-            }
-        }
-        .padding(20)
-        .background(.black.opacity(0.3), in: RoundedRectangle(cornerRadius: 8))
-        .overlay {
-            RoundedRectangle(cornerRadius: 8)
-                .stroke(
-                    LinearGradient(
-                        colors: [.white.opacity(0.2), .cyan.opacity(0.28), .pink.opacity(0.2)],
-                        startPoint: .topLeading,
-                        endPoint: .bottomTrailing
-                    ),
-                    lineWidth: 1
-                )
-        }
-    }
-}
-
-private struct HeaderBadge: View {
-    let title: String
-    let caption: String
-    let systemImage: String
-    let color: Color
-
-    var body: some View {
-        HStack(spacing: 7) {
-            Image(systemName: systemImage)
-                .foregroundStyle(color)
-            VStack(alignment: .leading, spacing: 0) {
-                Text(title)
-                    .font(.caption.weight(.heavy))
-                Text(caption)
-                    .font(.caption2.weight(.bold))
-                    .foregroundStyle(.white.opacity(0.55))
-            }
-        }
-        .foregroundStyle(.white)
-        .frame(maxWidth: .infinity)
-        .padding(.vertical, 10)
-        .background(.white.opacity(0.08), in: RoundedRectangle(cornerRadius: 8))
-    }
-}
-
-private struct DeckStage: View {
-    @Binding var leftDeck: DJDeckState
-    @Binding var rightDeck: DJDeckState
-    @Binding var crossfader: Double
-
-    var body: some View {
-        VStack(spacing: 14) {
-            HStack {
-                Label("Deck Stage", systemImage: "headphones")
-                    .font(.caption.weight(.heavy))
-                    .foregroundStyle(.white.opacity(0.7))
-                Spacer()
-                Text(crossfader < 0.44 ? "DECK A" : crossfader > 0.56 ? "DECK B" : "CENTER")
-                    .font(.caption.weight(.heavy))
-                    .foregroundStyle(.white)
-                    .padding(.horizontal, 10)
-                    .padding(.vertical, 6)
-                    .background(.white.opacity(0.1), in: Capsule())
-            }
-
-            HStack(spacing: 12) {
-                TurntableDeck(title: "DECK A", deck: $leftDeck, accent: .cyan)
-                TurntableDeck(title: "DECK B", deck: $rightDeck, accent: .pink)
-            }
-
-            VStack(alignment: .leading, spacing: 8) {
-                HStack {
-                    Text("CROSSFADER")
-                    Spacer()
-                    Text("A  /  B")
-                }
-                .font(.caption.weight(.heavy))
-                .foregroundStyle(.white.opacity(0.64))
-
-                Slider(value: $crossfader, in: 0...1)
-                    .tint(crossfader > 0.56 ? .pink : .cyan)
-            }
-        }
-        .padding(14)
-        .background(.black.opacity(0.46), in: RoundedRectangle(cornerRadius: 8))
-        .overlay(alignment: .top) {
-            Rectangle()
-                .fill(
-                    LinearGradient(
-                        colors: [.cyan.opacity(0.28), .pink.opacity(0.24), .clear],
-                        startPoint: .leading,
-                        endPoint: .trailing
-                    )
-                )
-                .frame(height: 2)
-        }
-        .overlay {
-            RoundedRectangle(cornerRadius: 8)
-                .stroke(.white.opacity(0.14), lineWidth: 1)
-        }
-    }
-}
-
-private struct TurntableDeck: View {
-    let title: String
-    @Binding var deck: DJDeckState
-    let accent: Color
-
-    var body: some View {
-        VStack(spacing: 12) {
-            HStack(spacing: 8) {
-                Text(title)
-                    .font(.caption.weight(.heavy))
-                    .foregroundStyle(accent)
-                Spacer()
-                Circle()
-                    .fill(deck.isPlaying ? Color.green : Color.white.opacity(0.26))
-                    .frame(width: 9, height: 9)
-            }
-
-            ZStack(alignment: .topTrailing) {
-                ZStack {
-                    Circle()
-                        .fill(
-                            RadialGradient(
-                                colors: [.black, Color(red: 0.08, green: 0.09, blue: 0.12), .black],
-                                center: .center,
-                                startRadius: 8,
-                                endRadius: 94
-                            )
-                        )
-                        .overlay {
-                            ForEach(0..<6, id: \.self) { index in
-                                Circle()
-                                    .stroke(.white.opacity(0.045 + Double(index) * 0.018), lineWidth: 1)
-                                    .padding(CGFloat(index * 12 + 10))
-                            }
-                        }
-                        .shadow(color: accent.opacity(0.32), radius: 18)
-
-                    EnergyRing(level: deck.gain, accent: accent)
-                        .padding(16)
-
-                    VStack(spacing: 2) {
-                        Text("\(deck.bpm)")
-                            .font(.system(.title2, design: .rounded, weight: .black))
-                            .monospacedDigit()
-                            .foregroundStyle(.white)
-                        Text("BPM")
-                            .font(.caption2.weight(.bold))
-                            .foregroundStyle(.white.opacity(0.58))
-                    }
-                }
-
-                TurntableNeedle(accent: accent)
-                    .frame(width: 48, height: 86)
-                    .offset(x: 8, y: 10)
-            }
-            .aspectRatio(1, contentMode: .fit)
-
-            VStack(spacing: 4) {
-                Text(deck.track.title)
-                    .font(.caption.weight(.heavy))
-                    .foregroundStyle(.white)
-                    .lineLimit(1)
-                Text(deck.track.artist)
-                    .font(.caption2.weight(.bold))
-                    .foregroundStyle(.white.opacity(0.58))
-                    .lineLimit(1)
-            }
-
-            CueWaveform(level: deck.gain, accent: accent)
-
-            Button {
-                deck.isPlaying.toggle()
-            } label: {
-                Image(systemName: deck.isPlaying ? "pause.fill" : "play.fill")
-                    .font(.headline.weight(.bold))
-                    .frame(width: 42, height: 34)
-            }
-            .buttonStyle(.plain)
-            .foregroundStyle(.black)
-            .background(accent, in: RoundedRectangle(cornerRadius: 8))
-            .accessibilityLabel(deck.isPlaying ? "暫停" : "播放")
-        }
-        .padding(12)
-        .background(.white.opacity(0.075), in: RoundedRectangle(cornerRadius: 8))
-        .overlay {
-            RoundedRectangle(cornerRadius: 8)
-                .stroke(.white.opacity(0.12), lineWidth: 1)
-        }
-    }
-}
-
-private struct EnergyRing: View {
-    let level: Double
-    let accent: Color
-
-    var body: some View {
-        Circle()
-            .trim(from: 0.08, to: min(0.94, max(0.12, level)))
-            .stroke(
-                AngularGradient(
-                    colors: [.clear, accent, .white.opacity(0.8), accent, .clear],
-                    center: .center
-                ),
-                style: StrokeStyle(lineWidth: 8, lineCap: .round)
-            )
-            .rotationEffect(.degrees(-110))
-            .shadow(color: accent.opacity(0.45), radius: 10)
-    }
-}
-
-private struct TurntableNeedle: View {
-    let accent: Color
-
-    var body: some View {
-        VStack(spacing: 0) {
-            Circle()
-                .fill(.white.opacity(0.9))
-                .frame(width: 16, height: 16)
-                .shadow(color: accent.opacity(0.5), radius: 8)
-
-            RoundedRectangle(cornerRadius: 2)
-                .fill(.white.opacity(0.68))
-                .frame(width: 5, height: 58)
-                .overlay(alignment: .bottom) {
-                    Capsule()
-                        .fill(accent)
-                        .frame(width: 12, height: 8)
-                }
-        }
-        .rotationEffect(.degrees(28))
-    }
-}
-
-private struct CueWaveform: View {
-    let level: Double
-    let accent: Color
-
-    var body: some View {
-        HStack(alignment: .center, spacing: 3) {
-            ForEach(0..<22, id: \.self) { index in
-                Capsule()
-                    .fill(index % 4 == 0 ? .white.opacity(0.72) : accent.opacity(0.76))
-                    .frame(width: 3, height: barHeight(for: index))
-            }
-        }
-        .frame(height: 30)
-        .padding(.horizontal, 8)
-        .background(.black.opacity(0.28), in: RoundedRectangle(cornerRadius: 8))
-        .accessibilityLabel("波形預覽")
-    }
-
-    private func barHeight(for index: Int) -> CGFloat {
-        let base = 8 + (index * 11) % 20
-        return CGFloat(base) * (0.72 + level * 0.46)
-    }
-}
-
-private struct MixerConsole: View {
-    @Binding var filter: Double
-    @Binding var reverb: Double
-    @Binding var leftGain: Double
-    @Binding var rightGain: Double
-    @Binding var selectedPad: Int
-    let onPadTrigger: (PadAction) -> Void
-
-    var body: some View {
-        VStack(spacing: 16) {
-            HStack {
-                Label("Mixer", systemImage: "slider.horizontal.below.rectangle")
-                    .font(.caption.weight(.heavy))
-                    .foregroundStyle(.white.opacity(0.7))
-                Spacer()
-                Text("FX BANK")
-                    .font(.caption.weight(.heavy))
-                    .foregroundStyle(.pink)
-            }
-
-            HStack(spacing: 14) {
-                Knob(value: $leftGain, title: "A Gain", accent: .cyan)
-                Knob(value: $filter, title: "Filter", accent: .yellow)
-                Knob(value: $reverb, title: "Reverb", accent: .green)
-                Knob(value: $rightGain, title: "B Gain", accent: .pink)
-            }
-
-            PadGrid(selectedPad: $selectedPad, onTrigger: onPadTrigger)
-        }
-        .padding(16)
-        .background(.black.opacity(0.42), in: RoundedRectangle(cornerRadius: 8))
-        .overlay {
-            RoundedRectangle(cornerRadius: 8)
-                .stroke(.white.opacity(0.12), lineWidth: 1)
-        }
-    }
-}
-
-private struct Knob: View {
-    @Binding var value: Double
-    let title: String
-    let accent: Color
-
-    var body: some View {
-        VStack(spacing: 8) {
-            ZStack {
-                Circle()
-                    .fill(.black.opacity(0.55))
-                    .overlay {
-                        Circle().stroke(.white.opacity(0.16), lineWidth: 1)
-                    }
-
-                Circle()
-                    .trim(from: 0, to: value)
-                    .stroke(accent, style: StrokeStyle(lineWidth: 5, lineCap: .round))
-                    .rotationEffect(.degrees(135))
-                    .padding(6)
-
-                Rectangle()
-                    .fill(accent)
-                    .frame(width: 3, height: 18)
-                    .offset(y: -17)
-                    .rotationEffect(.degrees(value * 270 - 135))
-            }
-            .frame(width: 58, height: 58)
-
-            Slider(value: $value, in: 0...1)
-                .labelsHidden()
-                .frame(width: 64)
-                .tint(accent)
-
-            Text(title)
-                .font(.caption2.weight(.bold))
-                .foregroundStyle(.white.opacity(0.72))
-                .lineLimit(1)
-                .minimumScaleFactor(0.78)
-        }
-        .frame(maxWidth: .infinity)
-    }
-}
-
-private struct PadGrid: View {
-    @Binding var selectedPad: Int
-    let onTrigger: (PadAction) -> Void
-
-    var body: some View {
-        LazyVGrid(columns: Array(repeating: GridItem(.flexible(), spacing: 8), count: 4), spacing: 8) {
-            ForEach(PadAction.allCases) { pad in
-                Button {
-                    onTrigger(pad)
-                } label: {
-                    VStack(spacing: 5) {
-                        Image(systemName: pad.systemImage)
-                            .font(.caption.weight(.heavy))
-                        Text(pad.title)
-                            .font(.caption2.weight(.heavy))
-                    }
-                    .foregroundStyle(.white)
-                    .frame(maxWidth: .infinity)
-                    .frame(height: 48)
-                    .background(pad.color.opacity(selectedPad == pad.rawValue ? 0.34 : 0.16), in: RoundedRectangle(cornerRadius: 8))
-                    .overlay {
-                        RoundedRectangle(cornerRadius: 8)
-                            .stroke(pad.color.opacity(selectedPad == pad.rawValue ? 0.78 : 0.28), lineWidth: 1)
-                    }
-                    .shadow(color: pad.color.opacity(selectedPad == pad.rawValue ? 0.28 : 0.08), radius: 8)
-                }
-                .buttonStyle(.plain)
-                .accessibilityAddTraits(selectedPad == pad.rawValue ? .isSelected : [])
-            }
-        }
-    }
-}
-
-private struct TrackLibrary: View {
-    let tracks: [DJTrack]
-    @Binding var selectedTrack: UUID
-    let onImport: () -> Void
-    let onLoadLeft: () -> Void
-    let onLoadRight: () -> Void
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 14) {
-            HStack {
-                VStack(alignment: .leading, spacing: 3) {
-                    Text("Library")
-                        .font(.title3.weight(.black))
-                        .foregroundStyle(.white)
-                    Text("匯入 MP3，或選一首歌載入到任一 Deck。")
-                        .font(.caption)
-                        .foregroundStyle(.white.opacity(0.6))
-                }
-
-                Spacer()
-
-                HStack(spacing: 8) {
-                    Button(action: onImport) {
-                        Image(systemName: "square.and.arrow.down")
-                            .font(.headline.weight(.heavy))
-                            .frame(width: 38, height: 38)
-                    }
-                    .buttonStyle(.plain)
-                    .foregroundStyle(.black)
-                    .background(Color.yellow, in: Circle())
-                    .accessibilityLabel("匯入 MP3")
-
-                    Button(action: onLoadLeft) {
-                        Text("A")
-                            .font(.headline.weight(.heavy))
-                            .frame(width: 38, height: 38)
-                    }
-                    .buttonStyle(.plain)
-                    .foregroundStyle(.black)
-                    .background(Color.cyan, in: Circle())
-                    .accessibilityLabel("載入到 Deck A")
-
-                    Button(action: onLoadRight) {
-                        Text("B")
-                            .font(.headline.weight(.heavy))
-                            .frame(width: 38, height: 38)
-                    }
-                    .buttonStyle(.plain)
-                    .foregroundStyle(.black)
-                    .background(Color.pink, in: Circle())
-                    .accessibilityLabel("載入到 Deck B")
-                }
-            }
-
-            VStack(spacing: 10) {
-                ForEach(tracks) { track in
-                    TrackRow(
-                        track: track,
-                        isSelected: selectedTrack == track.id,
-                        action: { selectedTrack = track.id }
-                    )
-                }
-            }
-        }
-        .padding(16)
-        .background(.black.opacity(0.36), in: RoundedRectangle(cornerRadius: 8))
-        .overlay {
-            RoundedRectangle(cornerRadius: 8)
-                .stroke(.white.opacity(0.12), lineWidth: 1)
-        }
-    }
-}
-
-private struct TrackRow: View {
-    let track: DJTrack
-    let isSelected: Bool
-    let action: () -> Void
-
-    var body: some View {
-        Button(action: action) {
-            HStack(spacing: 12) {
-                ZStack {
-                    Circle()
-                        .fill(.black.opacity(0.56))
-                    Circle()
-                        .stroke(track.color.opacity(0.9), lineWidth: 2)
-                        .padding(6)
-                    Image(systemName: track.sourceIcon)
-                        .font(.headline)
-                        .foregroundStyle(track.color)
-                }
-                .frame(width: 48, height: 48)
-
-                VStack(alignment: .leading, spacing: 4) {
-                    Text(track.title)
-                        .font(.headline.weight(.bold))
-                        .foregroundStyle(.white)
-                        .lineLimit(1)
-                    Text(track.artist)
-                        .font(.caption.weight(.semibold))
-                        .foregroundStyle(.white.opacity(0.58))
-                        .lineLimit(1)
-                }
-
-                Spacer(minLength: 8)
-
-                VStack(alignment: .trailing, spacing: 4) {
-                    Text("\(track.bpm) BPM")
-                        .font(.caption.weight(.heavy))
-                    Text(track.duration)
-                        .font(.caption2.weight(.bold))
-                        .foregroundStyle(.white.opacity(0.52))
-                }
-                .foregroundStyle(track.color)
-
-                Image(systemName: isSelected ? "checkmark.circle.fill" : "circle")
-                    .foregroundStyle(isSelected ? track.color : .white.opacity(0.28))
-            }
-            .padding(12)
-            .background(.white.opacity(isSelected ? 0.12 : 0.06), in: RoundedRectangle(cornerRadius: 8))
-            .overlay(alignment: .leading) {
-                Rectangle()
-                    .fill(isSelected ? track.color : .white.opacity(0.12))
-                    .frame(width: 3)
-            }
-        }
-        .buttonStyle(.plain)
-        .accessibilityAddTraits(isSelected ? .isSelected : [])
-    }
-}
-
-private extension DJTrack {
-    var sourceIcon: String {
-        switch source {
-        case .synth: "waveform"
-        case .file: "music.note.list"
-        }
     }
 }
 

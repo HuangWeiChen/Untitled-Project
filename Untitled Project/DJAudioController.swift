@@ -29,12 +29,12 @@ final class DJAudioController {
     private let engine = AVAudioEngine()
     private let leftPlayer = AVAudioPlayerNode()
     private let rightPlayer = AVAudioPlayerNode()
-    private let dropPlayer = AVAudioPlayerNode()
+    private let sfxPlayer = AVAudioPlayerNode()
     private let leftMixer = AVAudioMixerNode()
     private let rightMixer = AVAudioMixerNode()
-    private let dropMixer = AVAudioMixerNode()
+    private let sfxMixer = AVAudioMixerNode()
     private let masterMixer = AVAudioMixerNode()
-    private let masterEQ = AVAudioUnitEQ(numberOfBands: 1)
+    private let masterEQ = AVAudioUnitEQ(numberOfBands: 3)
     private let reverb = AVAudioUnitReverb()
     private let sampleRate = 44_100.0
 
@@ -46,6 +46,7 @@ final class DJAudioController {
 
     var isEngineRunning = false
     var errorMessage: String?
+    var activeSFXName: String?
 
     func prepare(
         leftTrack: DJTrack,
@@ -137,13 +138,33 @@ final class DJAudioController {
         rightMixer.outputVolume = Float(rightGain) * max(0.08, rightFade)
     }
 
+    func updateEQ(low: Double, mid: Double, high: Double) {
+        guard masterEQ.bands.count >= 3 else { return }
+
+        // Low band
+        let lowBand = masterEQ.bands[0]
+        lowBand.filterType = .lowShelf
+        lowBand.frequency = 180.0
+        lowBand.gain = Float((low - 0.5) * 24.0)
+        lowBand.bypass = false
+
+        // Mid band
+        let midBand = masterEQ.bands[1]
+        midBand.filterType = .parametric
+        midBand.frequency = 1000.0
+        midBand.bandwidth = 1.2
+        midBand.gain = Float((mid - 0.5) * 18.0)
+        midBand.bypass = false
+
+        // High band
+        let highBand = masterEQ.bands[2]
+        highBand.filterType = .highShelf
+        highBand.frequency = 6000.0
+        highBand.gain = Float((high - 0.5) * 20.0)
+        highBand.bypass = false
+    }
+
     func updateEffects(filter: Double, reverbAmount: Double) {
-        guard let band = masterEQ.bands.first else { return }
-        band.filterType = .parametric
-        band.frequency = Float(180 + filter * 5_800)
-        band.bandwidth = 1.2
-        band.gain = Float((filter - 0.5) * 18)
-        band.bypass = false
         let echoBoost = echoEnabled ? 28.0 : 0.0
         reverb.wetDryMix = Float(max(0.0, min(1.0, reverbAmount)) * 55 + echoBoost)
     }
@@ -158,16 +179,34 @@ final class DJAudioController {
     }
 
     func triggerDrop() {
+        triggerSFX(.drop)
+    }
+
+    func triggerSFX(_ sfx: SFXType) {
         do {
             try configureGraphIfNeeded()
             try configureAudioSession()
             try startEngineIfNeeded()
-            dropPlayer.stop()
-            dropPlayer.scheduleBuffer(makeDropBuffer(), at: nil)
-            dropPlayer.play()
+
+            sfxPlayer.stop()
+            let buffer: AVAudioPCMBuffer
+            switch sfx {
+            case .drop:
+                buffer = makeDropBuffer()
+            case .scratch:
+                buffer = makeScratchBuffer()
+            case .airhorn:
+                buffer = makeAirhornBuffer()
+            case .laser:
+                buffer = makeLaserBuffer()
+            }
+
+            sfxPlayer.scheduleBuffer(buffer, at: nil)
+            sfxPlayer.play()
+            activeSFXName = sfx.rawValue
             errorMessage = nil
         } catch {
-            errorMessage = "Drop 音效失敗：\(error.localizedDescription)"
+            errorMessage = "SFX 播放失敗：\(error.localizedDescription)"
         }
     }
 
@@ -176,10 +215,10 @@ final class DJAudioController {
 
         engine.attach(leftPlayer)
         engine.attach(rightPlayer)
-        engine.attach(dropPlayer)
+        engine.attach(sfxPlayer)
         engine.attach(leftMixer)
         engine.attach(rightMixer)
-        engine.attach(dropMixer)
+        engine.attach(sfxMixer)
         engine.attach(masterMixer)
         engine.attach(masterEQ)
         engine.attach(reverb)
@@ -187,15 +226,15 @@ final class DJAudioController {
         let format = engineFormat
         try connect(leftPlayer, to: leftMixer, format: format)
         try connect(rightPlayer, to: rightMixer, format: format)
-        try connect(dropPlayer, to: dropMixer, format: format)
+        try connect(sfxPlayer, to: sfxMixer, format: format)
         try connect(leftMixer, to: masterMixer, format: format)
         try connect(rightMixer, to: masterMixer, format: format)
-        try connect(dropMixer, to: masterMixer, format: format)
+        try connect(sfxMixer, to: masterMixer, format: format)
         try connect(masterMixer, to: masterEQ, format: format)
         try connect(masterEQ, to: reverb, format: format)
         try connect(reverb, to: engine.mainMixerNode, format: format)
 
-        dropMixer.outputVolume = 0.75
+        sfxMixer.outputVolume = 0.85
         reverb.loadFactoryPreset(.mediumRoom)
         reverb.wetDryMix = 18
         engine.prepare()
@@ -350,6 +389,81 @@ final class DJAudioController {
             let sample = Float(tone + sweep)
             channels[0][frame] = sample
             channels[1][frame] = sample * 0.92
+        }
+
+        return buffer
+    }
+
+    private func makeScratchBuffer() -> AVAudioPCMBuffer {
+        let duration = 0.65
+        let frameCapacity = AVAudioFrameCount(duration * sampleRate)
+        let buffer = AVAudioPCMBuffer(pcmFormat: engineFormat, frameCapacity: frameCapacity)!
+        buffer.frameLength = frameCapacity
+
+        guard let channels = buffer.floatChannelData else { return buffer }
+        let frameCount = Int(frameCapacity)
+
+        for frame in 0..<frameCount {
+            let progress = Double(frame) / Double(frameCount)
+            let speedMod = sin(progress * .pi * 8.0) * 1.5
+            let pitch = 450.0 + speedMod * 320.0
+            let envelope = sin(progress * .pi)
+            let tone = sin(2.0 * .pi * pitch * (Double(frame) / sampleRate)) * envelope * 0.5
+            let noise = deterministicNoise(frame * 31) * envelope * 0.25
+            let sample = Float(tone + noise)
+            channels[0][frame] = sample
+            channels[1][frame] = sample
+        }
+
+        return buffer
+    }
+
+    private func makeAirhornBuffer() -> AVAudioPCMBuffer {
+        let duration = 0.85
+        let frameCapacity = AVAudioFrameCount(duration * sampleRate)
+        let buffer = AVAudioPCMBuffer(pcmFormat: engineFormat, frameCapacity: frameCapacity)!
+        buffer.frameLength = frameCapacity
+
+        guard let channels = buffer.floatChannelData else { return buffer }
+        let frameCount = Int(frameCapacity)
+
+        for frame in 0..<frameCount {
+            let progress = Double(frame) / Double(frameCount)
+            let time = Double(frame) / sampleRate
+            let env = pow(sin(progress * .pi), 0.5)
+
+            // Multi-tone chord for reggae airhorn
+            let f1 = sin(2.0 * .pi * 466.16 * time)
+            let f2 = sin(2.0 * .pi * 587.33 * time)
+            let f3 = sin(2.0 * .pi * 698.46 * time)
+            let sample = Float((f1 + f2 + f3) * 0.28 * env)
+
+            channels[0][frame] = sample
+            channels[1][frame] = sample
+        }
+
+        return buffer
+    }
+
+    private func makeLaserBuffer() -> AVAudioPCMBuffer {
+        let duration = 0.7
+        let frameCapacity = AVAudioFrameCount(duration * sampleRate)
+        let buffer = AVAudioPCMBuffer(pcmFormat: engineFormat, frameCapacity: frameCapacity)!
+        buffer.frameLength = frameCapacity
+
+        guard let channels = buffer.floatChannelData else { return buffer }
+        let frameCount = Int(frameCapacity)
+
+        for frame in 0..<frameCount {
+            let progress = Double(frame) / Double(frameCount)
+            let time = Double(frame) / sampleRate
+            let pitch = 300.0 + pow(progress, 2.0) * 2400.0
+            let env = pow(1.0 - progress, 0.8)
+            let tone = sin(2.0 * .pi * pitch * time) * env * 0.55
+            let sample = Float(tone)
+
+            channels[0][frame] = sample
+            channels[1][frame] = sample
         }
 
         return buffer
